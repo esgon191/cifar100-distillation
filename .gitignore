@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Данные, модели и выходы обучения
+data/
+models/
+checkpoints/
+out/
