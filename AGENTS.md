@@ -61,12 +61,34 @@
 6. Множественные запуски с разными сидами и статистический анализ.
 7. Выводы и отчёт.
 
+## Структура кода (шаг 1)
+
+- `train.py` — единая точка входа обучения (учитель/ученик, `--arch resnet50|cnn`).
+- `kd/data.py` — загрузка CIFAR-100 (pickle `train/test/meta`), стратифицированное
+  разбиение train/val, `DeviceLoader`: датасет целиком на GPU в uint8, аугментации
+  (RandomCrop 32 pad 4 + HFlip) и нормализация батчево на устройстве — CPU Colab
+  не узкое место. Порядок/аугментации эпохи задаются (seed, epoch).
+- `kd/models.py` — `resnet50_cifar`, `SimpleCNN` (ёмкость: `--cnn_width`,
+  `--cnn_convs_per_stage`).
+- `kd/trainer.py` — SGD (nesterov) + warmup/cosine по итерациям, AMP, train/eval,
+  чекпоинты. Целевая функция — объект `(logits, targets, teacher_logits) -> (loss,
+  компоненты)`; KD-лосс шага 4 реализует тот же интерфейс, учитель передаётся в
+  `train_one_epoch`/`evaluate`.
+- Метрики в ClearML: график = метрика (`loss`, `ce`, `top1`, …), series = `train`/`val`.
+  Итог — single values `test/*`, `val/*` + артефакт `summary`; итоговая метрика —
+  финальная модель (конец косинуса), не лучшая по val.
+- Чекпоинт `out/<task_id>/checkpoint.pt` каждые `--save_every` эпох, `--resume` по
+  умолчанию; в Colab `--output_dir` — на Google Drive, либо `--upload_checkpoint`
+  (артефакт ClearML) + `--continue_task_id`.
+- `output_uri` = `Session.get_files_server_host()` (явно, мимо S3 из конфига);
+  автологирование `torch.save` выключено; в ClearML грузится только `model_final.pt`.
+- Данные: локально `data/cifar_100` (в .gitignore); на воркере, если файлов нет,
+  скачиваются через torchvision в `--data_dir`. ClearML Dataset — опционально
+  (`--dataset_name`).
+- Smoke-тесты: `python -m pytest tests` (venv в `venv/`).
+
 ## Открытые вопросы
 
-- Имя проекта в ClearML (по умолчанию в коде — `cifar100-distillation`).
-- Источник данных: CIFAR-100 через `torchvision.datasets` прямо на воркере или
-  регистрация как ClearML Dataset (`utils/clearml_utils.get_clearml_dataset`) —
-  решить на шаге 1 с учётом лимита хранилища.
 - Как именно исполняется задача в Colab: clearml-agent внутри Colab-ноутбука, слушающий
   очередь, или ручной запуск скрипта в Colab с `Task.init`. Название очереди.
 
