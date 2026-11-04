@@ -78,19 +78,53 @@
   Итог — single values `test/*`, `val/*` + артефакт `summary`; итоговая метрика —
   финальная модель (конец косинуса), не лучшая по val.
 - Чекпоинт `out/<task_id>/checkpoint.pt` каждые `--save_every` эпох, `--resume` по
-  умолчанию; в Colab `--output_dir` — на Google Drive, либо `--upload_checkpoint`
-  (артефакт ClearML) + `--continue_task_id`.
+  умолчанию; в Colab `--output_dir` — на Google Drive (см. «Запуск в Colab»), либо
+  `--upload_checkpoint` (артефакт ClearML) + `--continue_task_id`.
 - `output_uri` = `Session.get_files_server_host()` (явно, мимо S3 из конфига);
   автологирование `torch.save` выключено; в ClearML грузится только `model_final.pt`.
 - Данные: локально `data/cifar_100` (в .gitignore); на воркере, если файлов нет,
   скачиваются через torchvision в `--data_dir`. ClearML Dataset — опционально
   (`--dataset_name`).
 - Smoke-тесты: `python -m pytest tests` (venv в `venv/`).
+- `--weight_decay_norm_bias` (по умолчанию вкл.) — weight decay и на BN/bias, как в
+  классических CIFAR-рецептах; `--no-weight_decay_norm_bias` — только на веса conv/linear.
+
+## Запуск в Colab (решено)
+
+- **Основной путь — ручной запуск** `python train.py ...` из Colab-ноутбука
+  (`colab/train_teacher.ipynb`), задача ClearML создаётся `Task.init` внутри скрипта.
+  Ключи ClearML — из Colab Secrets через переменные окружения `CLEARML_API_*`
+  (наследуются процессом `train.py`), в коде и ноутбуке не хранятся.
+- В Colab torch/torchvision не переустанавливаются: ставится `requirements.txt` без них.
+- Чекпоинты — на Google Drive: `--output_dir /content/drive/MyDrive/cifar100-distillation/out`,
+  каталог запуска `<output_dir>/<task_id>`. После обрыва сессии — тот же набор аргументов
+  плюс `--continue_task_id <task_id>`: ClearML продолжает ту же задачу (тот же id → тот же
+  каталог → подхватывается `checkpoint.pt`). Проверено smoke-задачей.
+- Особенности `init_task`: без `--continue_task_id` всегда новая задача
+  (`reuse_last_task_id=False`); при продолжении проверяется, что id совпал (иначе ClearML
+  молча создал бы новую задачу и обучение пошло бы с нуля); сдвиг итераций при
+  продолжении отключён (`set_initial_iteration(0)`) — метрики репортятся по номеру эпохи.
+- clearml-agent в Colab (очередь `colab-t4`, системный Python без venv) — запасной вариант
+  для массовых запусков, описан в приложении ноутбука.
+
+## Шаг 2: учитель ResNet-50
+
+- Запуск: `colab/train_teacher.ipynb` → `train.py --arch resnet50 --tags teacher
+  --task_name teacher-resnet50-seed0 --num_train_epochs 200 --learning_rate 0.1
+  --per_device_train_batch_size 128 --weight_decay 5e-4 --warmup_epochs 1 --save_every 2`
+  (nesterov, косинус, AMP, `channels_last` — по умолчанию на CUDA). Без label smoothing:
+  учитель со сглаживанием хуже передаёт «тёмные знания».
+- Бюджет: ResNet-50 под 32×32 — ≈7.8 GFLOP на изображение (forward+backward), эпоха
+  45k примеров ≈3.5·10¹⁴ FLOP. Оценка для T4 (AMP, 6–10 TFLOPS эффективно) — 40–65 с
+  на эпоху, 200 эпох ≈2.5–3.5 ч, т.е. 1–2 сессии Colab. Это оценка — уточнить по
+  `epoch_time` первых эпох. Локально (Apple M4, MPS, fp32) — ≈140 img/s, ~5 мин/эпоха;
+  `channels_last` на MPS падает в backward (баг MPS), поэтому он включается только на CUDA.
+- Ориентир: ResNet-50 с этим рецептом на полном train — ≈77–79% top-1; у нас train 45k
+  (5k ушло в val), возможна потеря ≈0.5 п.п.
 
 ## Открытые вопросы
 
-- Как именно исполняется задача в Colab: clearml-agent внутри Colab-ноутбука, слушающий
-  очередь, или ручной запуск скрипта в Colab с `Task.init`. Название очереди.
+- Пока нет.
 
 ## Правила работы
 

@@ -14,6 +14,7 @@ import torch
 from cli.parser import get_parser
 from kd.data import DeviceLoader, load_cifar100, random_crop_flip, stratified_split
 from kd.models import build_model, count_params
+from kd.trainer import build_optimizer, build_scheduler
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data", "cifar_100")
@@ -86,6 +87,41 @@ def test_models_forward(arch):
         assert n < 1e6
 
 
+@pytest.mark.parametrize("decay_norm_bias", [True, False])
+def test_build_optimizer_weight_decay(decay_norm_bias):
+    model = build_model(get_parser().parse_args(["--arch", "resnet50"]))
+    opt = build_optimizer(model, 0.1, 5e-4, decay_norm_bias=decay_norm_bias)
+    n_total = sum(1 for _ in model.parameters())
+    groups = opt.param_groups
+    assert sum(len(g["params"]) for g in groups) == n_total
+
+    if decay_norm_bias:
+        assert len(groups) == 1 and groups[0]["weight_decay"] == 5e-4
+    else:
+        decay, no_decay = groups
+        assert decay["weight_decay"] == 5e-4 and no_decay["weight_decay"] == 0.0
+        assert all(p.ndim > 1 for p in decay["params"])
+        assert all(p.ndim <= 1 for p in no_decay["params"])
+        # BN-веса/сдвиги (2 на каждый BN) и bias классификатора
+        n_bn = sum(1 for m in model.modules() if isinstance(m, torch.nn.BatchNorm2d))
+        assert len(no_decay["params"]) == 2 * n_bn + 1
+
+
+def test_scheduler_warmup_cosine():
+    model = torch.nn.Linear(2, 2)
+    opt = build_optimizer(model, 0.1, 0.0)
+    sched = build_scheduler(opt, total_steps=100, warmup_steps=10)
+    lrs = []
+    for _ in range(100):
+        lrs.append(sched.get_last_lr()[0])
+        opt.step()
+        sched.step()
+    assert lrs[0] == pytest.approx(0.01)
+    assert lrs[9] == pytest.approx(0.1)
+    assert max(lrs) == pytest.approx(0.1)
+    assert lrs[-1] < 1e-3
+
+
 @pytest.mark.skipif(not has_data, reason="нет data/cifar_100")
 def test_load_cifar100():
     data = load_cifar100(DATA_DIR, download=False)
@@ -104,6 +140,7 @@ def test_train_resume(tmp_path):
         "--max_train_samples", "512", "--val_size", "500",
         "--per_device_train_batch_size", "64", "--save_every", "1",
         "--warmup_epochs", "0", "--task_name", "smoke",
+        "--no-weight_decay_norm_bias",
     ]
     run = lambda epochs: subprocess.run(
         common + ["--num_train_epochs", str(epochs)],

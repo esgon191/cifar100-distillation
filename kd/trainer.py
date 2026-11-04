@@ -39,10 +39,27 @@ def build_optimizer(
         learning_rate: float,
         weight_decay: float,
         momentum: float = 0.9,
-        nesterov: bool = True
+        nesterov: bool = True,
+        decay_norm_bias: bool = True
 ) -> torch.optim.Optimizer:
+    """
+    SGD с momentum. decay_norm_bias=False исключает из weight decay
+    одномерные параметры (веса/сдвиги BatchNorm и bias'ы) — для них
+    L2-штраф не регуляризует, а лишь сжимает масштаб
+    """
+    if decay_norm_bias:
+        params = model.parameters()
+    else:
+        decay, no_decay = [], []
+        for p in model.parameters():
+            if p.requires_grad:
+                (no_decay if p.ndim <= 1 else decay).append(p)
+        params = [
+            {"params": decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
     return torch.optim.SGD(
-        model.parameters(),
+        params,
         lr=learning_rate,
         momentum=momentum,
         weight_decay=weight_decay,
@@ -104,6 +121,9 @@ def train_one_epoch(
     Возвращает средние по примерам loss, компоненты лосса и top1 на train
     """
     model.train()
+    if teacher is not None:
+        # Учитель всегда в режиме eval: BN на накопленных статистиках
+        teacher.eval()
     sums: dict[str, torch.Tensor] = {}
     n_seen = 0
 
@@ -152,6 +172,8 @@ def evaluate(
     Оценка без аугментаций: loss, компоненты лосса, top1, top5
     """
     model.eval()
+    if teacher is not None:
+        teacher.eval()
     sums: dict[str, torch.Tensor] = {}
     n_seen = 0
 

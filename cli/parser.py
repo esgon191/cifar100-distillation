@@ -22,6 +22,7 @@ DEFAULTS = {
     "per_device_eval_batch_size": 512,
     "num_train_epochs": 200,
     "weight_decay": 5e-4,
+    "weight_decay_norm_bias": True,
     "num_labels": 100,
     "eval_every": 1,
     "save_every": 5,
@@ -228,6 +229,14 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULTS["weight_decay"],
         help="L2 регуляризация"
+    )
+
+    p.add_argument(
+        "--weight_decay_norm_bias",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULTS["weight_decay_norm_bias"],
+        help="Применять weight decay к BatchNorm и bias "
+             "(--no-weight_decay_norm_bias — только к весам conv/linear)"
     )
 
     p.add_argument(

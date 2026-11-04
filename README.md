@@ -3,3 +3,4 @@
 оценка статистической значимости улучшения. Эксперименты фиксируются в ClearML.
 
 Договорённости и план работ — в [AGENTS.md](AGENTS.md).
+Обучение учителя в Google Colab (T4) — ноутбук [colab/train_teacher.ipynb](colab/train_teacher.ipynb).

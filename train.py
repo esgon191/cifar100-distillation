@@ -34,7 +34,13 @@ def init_task(args):
     Артефакты и модели — на files server ClearML: адрес задаётся явно, т.к.
     output_uri=True подхватил бы default_output_uri (S3) из ~/clearml.conf.
     Автологирование torch.save отключено, чтобы промежуточные чекпоинты
-    не расходовали хранилище
+    не расходовали хранилище.
+
+    Продолжение: каталог запуска — out/<task_id>, поэтому id продолжаемой
+    задачи обязан совпасть с переданным (иначе чекпоинт не найдётся и обучение
+    молча начнётся заново). Без --continue_task_id всегда создаётся новая
+    задача (reuse_last_task_id=False), иначе ClearML мог бы переиспользовать
+    недавний «пустой» запуск с тем же именем
     """
     from clearml import Task
     from clearml.backend_api.session import Session
@@ -45,9 +51,19 @@ def init_task(args):
         task_type=Task.TaskTypes.training,
         tags=[args.arch, *args.tags],
         output_uri=Session.get_files_server_host(),
+        reuse_last_task_id=False,
         continue_last_task=args.continue_task_id or False,
         auto_connect_frameworks={"pytorch": False},
     )
+    # На воркере (clearml-agent) id задачи задаёт очередь — проверка только для ручного запуска
+    if args.continue_task_id and Task.running_locally() and task.id != args.continue_task_id:
+        raise RuntimeError(
+            f"Не удалось продолжить задачу {args.continue_task_id} "
+            f"(ClearML создал новую: {task.id}) — проверь id"
+        )
+    # Метрики репортятся с явным номером эпохи; при продолжении ClearML сдвигает
+    # итерации на последнюю отправленную — отключаем сдвиг, чтобы графики не «уезжали»
+    task.set_initial_iteration(0)
     task.connect(args, name="Args")
     return task
 
@@ -109,7 +125,8 @@ def main():
 
     steps_per_epoch = len(train_loader)
     optimizer = build_optimizer(
-        model, args.learning_rate, args.weight_decay, args.momentum, args.nesterov
+        model, args.learning_rate, args.weight_decay, args.momentum, args.nesterov,
+        decay_norm_bias=args.weight_decay_norm_bias
     )
     scheduler = build_scheduler(
         optimizer,
