@@ -53,7 +53,8 @@ def init_task(args):
         output_uri=Session.get_files_server_host(),
         reuse_last_task_id=False,
         continue_last_task=args.continue_task_id or False,
-        auto_connect_frameworks={"pytorch": False},
+        # TF/TensorBoard не используем; в Colab их биндинг лишь импортирует TensorFlow
+        auto_connect_frameworks={"pytorch": False, "tensorflow": False, "tensorboard": False},
     )
     # На воркере (clearml-agent) id задачи задаёт очередь — проверка только для ручного запуска
     if args.continue_task_id and Task.running_locally() and task.id != args.continue_task_id:

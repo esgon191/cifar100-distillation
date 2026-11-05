@@ -82,9 +82,12 @@
   `--upload_checkpoint` (артефакт ClearML) + `--continue_task_id`.
 - `output_uri` = `Session.get_files_server_host()` (явно, мимо S3 из конфига);
   автологирование `torch.save` выключено; в ClearML грузится только `model_final.pt`.
-- Данные: локально `data/cifar_100` (в .gitignore); на воркере, если файлов нет,
-  скачиваются через torchvision в `--data_dir`. ClearML Dataset — опционально
-  (`--dataset_name`).
+- Данные: локально `data/cifar_100` (в .gitignore). На воркере/в Colab — ClearML Dataset
+  `cifar100` v1.0.0 (проект `cifar100-distillation`, files server, 163 МБ):
+  `--dataset_name cifar100`. Зарегистрирован `register_dataset.py` (один раз; S3 из
+  конфига обходится через `CLEARML_DEFAULT_OUTPUT_URI`, т.к. `Dataset.create`
+  принудительно ставит `output_uri=True`). Скачивание torchvision (если в `--data_dir`
+  нет файлов) — запасной путь: сервер CIFAR отдаёт ~90 КБ/с.
 - Smoke-тесты: `python -m pytest tests` (venv в `venv/`).
 - `--weight_decay_norm_bias` (по умолчанию вкл.) — weight decay и на BN/bias, как в
   классических CIFAR-рецептах; `--no-weight_decay_norm_bias` — только на веса conv/linear.
