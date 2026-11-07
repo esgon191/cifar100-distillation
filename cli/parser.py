@@ -13,6 +13,7 @@ DEFAULTS = {
     "seed": 0,
     "init_seed": 0,
     "n_runs": 1,
+    "parallel_runs": 1,
     "arch": "resnet50",
     "cnn_width": 32,
     "cnn_convs_per_stage": 2,
@@ -176,6 +177,21 @@ def get_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULTS["n_runs"],
         help="Число запусков серии из разных начальных состояний"
+    )
+
+    p.add_argument(
+        "--parallel_runs",
+        type=int,
+        default=DEFAULTS["parallel_runs"],
+        help="Сколько запусков серии обучать одновременно одной группой на общих батчах "
+             "(векторизованно, kd/stacked.py)"
+    )
+
+    p.add_argument(
+        "--report_only",
+        action="store_true",
+        help="Не обучать: собрать таблицы серии из файлов в <output_dir>/<task_id> "
+             "и зарепортить их в ClearML (вместе с --continue_task_id)"
     )
 
     p.add_argument(

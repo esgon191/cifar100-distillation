@@ -24,5 +24,9 @@ def validate_args(args) -> None:
         raise ArgumentTypeError("--eval_every и --save_every должны быть > 0")
     if args.n_runs <= 0:
         raise ArgumentTypeError("--n_runs должен быть > 0")
+    if args.parallel_runs <= 0:
+        raise ArgumentTypeError("--parallel_runs должен быть > 0")
+    if args.report_only and args.clearml and not args.continue_task_id:
+        raise ArgumentTypeError("--report_only с ClearML требует --continue_task_id серии")
     if args.continue_task_id and not args.clearml:
         raise ArgumentTypeError("--continue_task_id требует --clearml")

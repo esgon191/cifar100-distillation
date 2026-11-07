@@ -1,6 +1,10 @@
 """
 Цикл обучения и оценки: SGD + warmup/cosine, AMP (fp16) на CUDA,
-чекпоинты для продолжения обучения после обрыва сессии
+чекпоинты для продолжения обучения после обрыва сессии.
+
+Цикл работает с группой из K моделей (kd/stacked.py::StackedModel):
+модель возвращает логиты [K, B, C], целевая функция — лосс каждой модели [K],
+метрики возвращаются списком из K словарей. Одиночная модель — случай K=1
 """
 import math
 import os
@@ -45,7 +49,8 @@ def build_optimizer(
     """
     SGD с momentum. decay_norm_bias=False исключает из weight decay
     одномерные параметры (веса/сдвиги BatchNorm и bias'ы) — для них
-    L2-штраф не регуляризует, а лишь сжимает масштаб
+    L2-штраф не регуляризует, а лишь сжимает масштаб. У сложенных параметров
+    группы моделей размерность берётся у одной модели (_base_ndim)
     """
     if decay_norm_bias:
         params = model.parameters()
@@ -53,7 +58,8 @@ def build_optimizer(
         decay, no_decay = [], []
         for p in model.parameters():
             if p.requires_grad:
-                (no_decay if p.ndim <= 1 else decay).append(p)
+                ndim = getattr(p, "_base_ndim", p.ndim)
+                (no_decay if ndim <= 1 else decay).append(p)
         params = [
             {"params": decay},
             {"params": no_decay, "weight_decay": 0.0},
@@ -84,24 +90,47 @@ def build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def per_model_cross_entropy(
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        label_smoothing: float = 0.0
+) -> torch.Tensor:
+    """CE каждой модели группы: logits [K, B, C], targets [B] -> [K]"""
+    k, b, c = logits.shape
+    ce = F.cross_entropy(
+        logits.reshape(k * b, c), targets.repeat(k),
+        reduction="none", label_smoothing=label_smoothing
+    )
+    return ce.view(k, b).mean(1)
+
+
 class CrossEntropyObjective:
     """
     Обычная перекрёстная энтропия по меткам.
-    Интерфейс целевой функции: (logits, targets, teacher_logits) -> (loss, компоненты),
-    компоненты — словарь detached-тензоров для логирования
+    Интерфейс целевой функции группы моделей:
+    (logits [K, B, C], targets [B], teacher_logits [B, C] | None) -> (loss [K], компоненты),
+    компоненты — словарь detached-тензоров [K] для логирования
     """
 
     def __init__(self, label_smoothing: float = 0.0):
         self.label_smoothing = label_smoothing
 
     def __call__(self, logits, targets, teacher_logits=None):
-        loss = F.cross_entropy(logits, targets, label_smoothing=self.label_smoothing)
+        loss = per_model_cross_entropy(logits, targets, self.label_smoothing)
         return loss, {"ce": loss.detach()}
 
 
 def _topk_correct(logits: torch.Tensor, targets: torch.Tensor, k: int) -> torch.Tensor:
-    topk = logits.topk(k, dim=1).indices
-    return (topk == targets[:, None]).any(dim=1).sum()
+    """Число попаданий в top-k для каждой модели: logits [K, B, C] -> [K]"""
+    topk = logits.topk(k, dim=-1).indices
+    return (topk == targets[None, :, None]).any(dim=-1).sum(dim=-1)
+
+
+def _per_model(sums: dict[str, torch.Tensor], n_seen: int) -> list[dict]:
+    """Суммы [K] по примерам -> список из K словарей средних"""
+    means = {name: (value / n_seen).tolist() for name, value in sums.items()}
+    k = len(next(iter(means.values())))
+    return [{name: values[i] for name, values in means.items()} for i in range(k)]
 
 
 def macro_precision_recall(
@@ -134,18 +163,23 @@ def train_one_epoch(
         device: torch.device,
         amp: bool,
         teacher: nn.Module | None = None
-) -> dict:
+) -> tuple[list[dict], int]:
     """
-    Одна эпоха обучения. Если передан teacher — он прогоняется онлайн
-    на тех же аугментированных батчах, его логиты уходят в objective.
-    Возвращает средние по примерам loss, компоненты лосса и top1 на train
+    Одна эпоха обучения группы моделей на общих батчах. Если передан teacher —
+    он прогоняется онлайн один раз на батч, его логиты уходят в objective
+    всех моделей группы. Для backward берётся сумма лоссов моделей: параметры
+    не пересекаются, поэтому каждая модель получает градиент своего лосса.
+
+    Возвращает (метрики каждой модели: средние по примерам loss, компоненты
+    лосса и top1 на train; число шагов, пропущенных GradScaler из-за
+    переполнения fp16 — общее на группу)
     """
     model.train()
     if teacher is not None:
         # Учитель всегда в режиме eval: BN на накопленных статистиках
         teacher.eval()
     sums: dict[str, torch.Tensor] = {}
-    n_seen = 0
+    n_seen, skipped = 0, 0
 
     for x, y in loader:
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
@@ -161,9 +195,15 @@ def train_one_epoch(
         )
 
         optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+        scaler.scale(loss.sum()).backward()
         scaler.step(optimizer)
-        scaler.update()
+        if amp:
+            # Шаг пропущен (inf/nan в fp16) — скейлер уменьшает масштаб
+            scale = scaler.get_scale()
+            scaler.update()
+            skipped += int(scaler.get_scale() < scale)
+        else:
+            scaler.update()
         scheduler.step()
 
         b = y.shape[0]
@@ -171,12 +211,13 @@ def train_one_epoch(
         batch_stats = {"loss": loss.detach(), **parts}
         for name, value in batch_stats.items():
             sums[name] = sums.get(name, 0) + value.float() * b
-        sums["top1"] = sums.get("top1", 0) + (logits.detach().argmax(1) == y).sum()
+        sums["top1"] = sums.get("top1", 0) + (logits.detach().argmax(-1) == y).sum(-1)
 
-    metrics = {name: (value / n_seen).item() for name, value in sums.items()}
-    if not math.isfinite(metrics["loss"]):
-        raise FloatingPointError(f"Лосс на train не конечен: {metrics['loss']}")
-    return metrics
+    metrics = _per_model(sums, n_seen)
+    bad = [i for i, m in enumerate(metrics) if not math.isfinite(m["loss"])]
+    if bad:
+        raise FloatingPointError(f"Лосс на train не конечен у моделей группы {bad}")
+    return metrics, skipped
 
 
 @torch.no_grad()
@@ -186,18 +227,21 @@ def evaluate(
         objective,
         device: torch.device,
         amp: bool,
-        teacher: nn.Module | None = None
-) -> dict:
+        teacher: nn.Module | None = None,
+        return_logits: bool = False
+) -> list[dict] | tuple[list[dict], torch.Tensor]:
     """
-    Оценка без аугментаций: loss, компоненты лосса, top1, top5,
-    macro precision и macro recall (по предсказаниям всей выборки)
+    Оценка группы моделей без аугментаций. Для каждой модели: loss,
+    компоненты лосса, top1, top5, macro precision и macro recall
+    (по предсказаниям всей выборки). return_logits=True дополнительно
+    возвращает логиты [K, N, C] (fp16, на CPU) в порядке загрузчика
     """
     model.eval()
     if teacher is not None:
         teacher.eval()
     sums: dict[str, torch.Tensor] = {}
     n_seen = 0
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_logits = [], [], []
     num_classes = None
 
     for x, y in loader:
@@ -215,17 +259,21 @@ def evaluate(
         n_seen += b
         for name, value in {"loss": loss, **parts}.items():
             sums[name] = sums.get(name, 0) + value.float() * b
-        preds = logits.argmax(1)
-        sums["top1"] = sums.get("top1", 0) + (preds == y).sum()
+        preds = logits.argmax(-1)
+        sums["top1"] = sums.get("top1", 0) + (preds == y).sum(-1)
         sums["top5"] = sums.get("top5", 0) + _topk_correct(logits, y, 5)
         all_preds.append(preds)
         all_targets.append(y)
-        num_classes = logits.shape[1]
+        if return_logits:
+            all_logits.append(logits.half().cpu())
+        num_classes = logits.shape[-1]
 
-    metrics = {name: (value / n_seen).item() for name, value in sums.items()}
-    metrics["precision"], metrics["recall"] = macro_precision_recall(
-        torch.cat(all_preds), torch.cat(all_targets), num_classes
-    )
+    metrics = _per_model(sums, n_seen)
+    preds, targets = torch.cat(all_preds, dim=1), torch.cat(all_targets)
+    for k, m in enumerate(metrics):
+        m["precision"], m["recall"] = macro_precision_recall(preds[k], targets, num_classes)
+    if return_logits:
+        return metrics, torch.cat(all_logits, dim=1)
     return metrics
 
 
