@@ -121,8 +121,21 @@ def collect_results(task_ids: list[str]) -> "pd.DataFrame":
     return pd.DataFrame(rows).sort_values("n_params")
 
 
+def check_queue(name: str) -> None:
+    """Очередь должна существовать (её создаёт агент: clearml-agent daemon --create-queue)"""
+    from clearml.backend_api.session.client import APIClient
+
+    if not APIClient().queues.get_all(name=f"^{name}$"):
+        raise SystemExit(
+            f'Очередь "{name}" не найдена на сервере ClearML. Сначала запусти агента '
+            f"(colab/agent.ipynb: clearml-agent daemon --queue {name} --create-queue)"
+        )
+
+
 def main():
     args = get_parser().parse_args()
+    if not args.create_only:
+        check_queue(args.queue)
 
     # Контроллер — отдельная задача типа optimizer; артефакты на files server (не S3)
     controller = Task.init(
