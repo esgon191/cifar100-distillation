@@ -5,7 +5,8 @@
 из очереди (в Colab — colab/agent.ipynb). Цель — val/top1 финальной модели.
 
 Контроллер лёгкий (только ставит задачи в очередь и опрашивает их),
-запускается локально или ячейкой Colab:
+запускается локально или ячейкой Colab (optimizer.start(), не start_locally():
+тот исполнил бы задачи сетки на машине контроллера):
     python scripts/capacity_search.py --queue colab-t4 \
         --output_dir /content/drive/MyDrive/cifar100-distillation/out
 
@@ -169,7 +170,9 @@ def main():
         spawn_project=None,
         pool_period_min=1.0,
     )
-    optimizer.start_locally()
+    # start(): контроллер работает в этом процессе, а задачи сетки ставятся в очередь
+    # агенту. start_locally() не подходит — он исполнил бы их здесь же, на этой машине
+    optimizer.start()
     optimizer.wait()
     optimizer.stop()
 
