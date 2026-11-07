@@ -104,6 +104,26 @@ def _topk_correct(logits: torch.Tensor, targets: torch.Tensor, k: int) -> torch.
     return (topk == targets[:, None]).any(dim=1).sum()
 
 
+def macro_precision_recall(
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+        num_classes: int
+) -> tuple[float, float]:
+    """
+    Macro precision и macro recall: метрика считается по каждому классу,
+    затем усредняется без весов. Усреднение — по классам, встречающимся
+    в истинных метках; класс без предсказаний получает precision 0
+    (как zero_division=0 в sklearn)
+    """
+    tp = torch.bincount(targets[preds == targets], minlength=num_classes).float()
+    n_pred = torch.bincount(preds, minlength=num_classes).float()
+    n_true = torch.bincount(targets, minlength=num_classes).float()
+    present = n_true > 0
+    precision = torch.where(n_pred > 0, tp / n_pred.clamp(min=1), torch.zeros_like(tp))
+    recall = tp / n_true.clamp(min=1)
+    return precision[present].mean().item(), recall[present].mean().item()
+
+
 def train_one_epoch(
         model: nn.Module,
         loader,
@@ -169,13 +189,16 @@ def evaluate(
         teacher: nn.Module | None = None
 ) -> dict:
     """
-    Оценка без аугментаций: loss, компоненты лосса, top1, top5
+    Оценка без аугментаций: loss, компоненты лосса, top1, top5,
+    macro precision и macro recall (по предсказаниям всей выборки)
     """
     model.eval()
     if teacher is not None:
         teacher.eval()
     sums: dict[str, torch.Tensor] = {}
     n_seen = 0
+    all_preds, all_targets = [], []
+    num_classes = None
 
     for x, y in loader:
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
@@ -192,10 +215,18 @@ def evaluate(
         n_seen += b
         for name, value in {"loss": loss, **parts}.items():
             sums[name] = sums.get(name, 0) + value.float() * b
-        sums["top1"] = sums.get("top1", 0) + (logits.argmax(1) == y).sum()
+        preds = logits.argmax(1)
+        sums["top1"] = sums.get("top1", 0) + (preds == y).sum()
         sums["top5"] = sums.get("top5", 0) + _topk_correct(logits, y, 5)
+        all_preds.append(preds)
+        all_targets.append(y)
+        num_classes = logits.shape[1]
 
-    return {name: (value / n_seen).item() for name, value in sums.items()}
+    metrics = {name: (value / n_seen).item() for name, value in sums.items()}
+    metrics["precision"], metrics["recall"] = macro_precision_recall(
+        torch.cat(all_preds), torch.cat(all_targets), num_classes
+    )
+    return metrics
 
 
 def save_checkpoint(

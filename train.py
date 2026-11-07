@@ -2,30 +2,29 @@
 Обучение модели на CIFAR-100 (учитель ResNet-50 или CNN-ученик) с логированием
 в ClearML. Пример:
     python train.py --arch resnet50 --seed 0 --tags teacher
-    python train.py --arch cnn --cnn_width 32 --seed 1 --tags student-ce
+    python train.py --arch cnn --cnn_width 32 --n_runs 10 --init_seed 0 --tags student-ce
+
+--n_runs запусков серии отличаются только начальными весами (сиды из --init_seed);
+порядок батчей, аугментации и прочую случайность задаёт общий --seed
+(см. kd/experiment.py)
 """
 import json
 import os
-import time
-
-import torch
 
 from cli.parser import get_parser
 from cli.validators import validate_args
 from kd.data import DeviceLoader, load_cifar100, stratified_split
-from kd.models import build_model, count_params
-from kd.trainer import (
-    CrossEntropyObjective,
-    build_optimizer,
-    build_scheduler,
-    evaluate,
-    get_device,
-    load_checkpoint,
-    save_checkpoint,
-    set_seed,
-    train_one_epoch,
-)
-from utils.clearml_utils import get_clearml_dataset, report_single_values, report_split_metrics
+from kd.experiment import CrossEntropyExperiment, Loaders, aggregate_runs
+from kd.models import model_spec
+from kd.trainer import get_device, set_seed
+from utils.clearml_utils import get_clearml_dataset, report_single_values
+
+
+def default_task_name(args) -> str:
+    """Имя задачи по умолчанию: архитектура, ёмкость, сиды и число запусков"""
+    arch = args.arch if args.arch != "cnn" else f"cnn-w{args.cnn_width}-c{args.cnn_convs_per_stage}"
+    name = f"{arch}-seed{args.seed}-init{args.init_seed}"
+    return name if args.n_runs == 1 else f"{name}-x{args.n_runs}"
 
 
 def init_task(args):
@@ -47,7 +46,7 @@ def init_task(args):
 
     task = Task.init(
         project_name=args.project_name,
-        task_name=args.task_name or f"{args.arch}-seed{args.seed}",
+        task_name=args.task_name,
         task_type=Task.TaskTypes.training,
         tags=[args.arch, *args.tags],
         output_uri=Session.get_files_server_host(),
@@ -69,29 +68,49 @@ def init_task(args):
     return task
 
 
-def find_checkpoint(ckpt_path: str, task) -> str | None:
+def report_series(task, args, results: list[dict], run_dir: str) -> None:
     """
-    Чекпоинт для продолжения: локальный файл запуска, иначе
-    артефакт 'checkpoint' текущей задачи ClearML
+    Итог серии в ClearML: single values (среднее и std по запускам),
+    артефакты summary и runs (таблица по запускам), веса первого запуска
     """
-    if os.path.isfile(ckpt_path):
-        return ckpt_path
-    if task is not None and "checkpoint" in task.artifacts:
-        return task.artifacts["checkpoint"].get_local_copy()
-    return None
+    import pandas as pd
+    from clearml import OutputModel
+
+    agg = aggregate_runs(results)
+    report_single_values("val", agg["val"])
+    report_single_values("test", agg["test"])
+    report_single_values("model", {"n_params": agg["n_params"], "best_val_top1": agg["best_val_top1"]})
+
+    runs = pd.DataFrame([
+        {
+            "run": r["run"], "model_seed": r["model_seed"], "best_val_top1": r["best_val_top1"],
+            **{f"val/{k}": v for k, v in r["val"].items()},
+            **{f"test/{k}": v for k, v in r["test"].items()},
+        }
+        for r in results
+    ])
+    task.upload_artifact("runs", artifact_object=runs)
+    task.upload_artifact("summary", artifact_object={**agg, "args": vars(args)})
+    # Только веса первого запуска — хранилище files server ограничено,
+    # остальные лежат в <output_dir>/<task_id>/run_<i>/
+    OutputModel(task=task, name=f"{args.task_name}-run0", framework="PyTorch").update_weights(
+        weights_filename=os.path.join(run_dir, "run_0", "model_final.pt"), auto_delete_file=False
+    )
 
 
 def main():
     args = get_parser().parse_args()
     validate_args(args)
+    if args.task_name is None:
+        args.task_name = default_task_name(args)
 
     task = init_task(args) if args.clearml else None
 
+    # Глобальный сид: порядок батчей, аугментации и прочая случайность (кроме весов)
     set_seed(args.seed, deterministic=args.deterministic)
     device = get_device()
-    amp = args.fp16 and device.type == "cuda"
     channels_last = device.type == "cuda"
-    print(f"Устройство: {device}, AMP: {amp}")
+    print(f"Устройство: {device}, AMP: {args.fp16 and device.type == 'cuda'}")
 
     # --- Данные ---
     data_dir = args.data_dir
@@ -104,119 +123,40 @@ def main():
         train_idx = train_idx[:args.max_train_samples]
     print(f"train: {len(train_idx)}, val: {len(val_idx)}, test: {len(data.y_test)}")
 
-    train_loader = DeviceLoader(
-        data.x_train[train_idx], data.y_train[train_idx],
-        batch_size=args.per_device_train_batch_size, device=device,
-        shuffle=True, augment=True, drop_last=True, seed=args.seed,
-        channels_last=channels_last
-    )
     eval_kwargs = dict(
         batch_size=args.per_device_eval_batch_size, device=device,
         channels_last=channels_last
     )
-    val_loader = DeviceLoader(data.x_train[val_idx], data.y_train[val_idx], **eval_kwargs)
-    test_loader = DeviceLoader(data.x_test, data.y_test, **eval_kwargs)
-
-    # --- Модель и оптимизация ---
-    model = build_model(args).to(device)
-    if channels_last:
-        model = model.to(memory_format=torch.channels_last)
-    n_params = count_params(model)
-    print(f"{args.arch}: {n_params / 1e6:.2f}M параметров")
-
-    steps_per_epoch = len(train_loader)
-    optimizer = build_optimizer(
-        model, args.learning_rate, args.weight_decay, args.momentum, args.nesterov,
-        decay_norm_bias=args.weight_decay_norm_bias
+    loaders = Loaders(
+        train=DeviceLoader(
+            data.x_train[train_idx], data.y_train[train_idx],
+            batch_size=args.per_device_train_batch_size, device=device,
+            shuffle=True, augment=True, drop_last=True, seed=args.seed,
+            channels_last=channels_last
+        ),
+        val=DeviceLoader(data.x_train[val_idx], data.y_train[val_idx], **eval_kwargs),
+        test=DeviceLoader(data.x_test, data.y_test, **eval_kwargs),
     )
-    scheduler = build_scheduler(
-        optimizer,
-        total_steps=args.num_train_epochs * steps_per_epoch,
-        warmup_steps=args.warmup_epochs * steps_per_epoch
-    )
-    scaler = torch.amp.GradScaler("cuda", enabled=amp)
-    objective = CrossEntropyObjective(args.label_smoothing)
 
-    # --- Продолжение с чекпоинта ---
-    run_name = task.id if task is not None else (args.task_name or f"{args.arch}-seed{args.seed}")
-    run_dir = os.path.join(args.output_dir, run_name)
+    # --- Серия запусков ---
+    model_cls, model_kwargs = model_spec(args)
+    run_dir = os.path.join(args.output_dir, task.id if task is not None else args.task_name)
     os.makedirs(run_dir, exist_ok=True)
-    ckpt_path = os.path.join(run_dir, "checkpoint.pt")
+    experiment = CrossEntropyExperiment(
+        args, model_cls, model_kwargs, loaders, device, run_dir, task=task
+    )
+    print(f"{args.task_name}: запусков {args.n_runs}, init_seed {args.init_seed}")
+    results = experiment.run(args.n_runs, args.init_seed)
 
-    start_epoch, best_val_top1 = 0, 0.0
-    if args.resume:
-        found = find_checkpoint(ckpt_path, task)
-        if found is not None:
-            start_epoch, extra = load_checkpoint(found, model, optimizer, scheduler, scaler, device)
-            best_val_top1 = extra.get("best_val_top1", 0.0)
-            print(f"Продолжение с эпохи {start_epoch} ({found})")
-
-    # --- Обучение ---
-    val_metrics = {}
-    for epoch in range(start_epoch, args.num_train_epochs):
-        last_epoch = epoch == args.num_train_epochs - 1
-        train_loader.set_epoch(epoch)
-        t0 = time.time()
-        train_metrics = train_one_epoch(
-            model, train_loader, optimizer, scheduler, scaler, objective, device, amp
-        )
-        train_metrics["lr"] = scheduler.get_last_lr()[0]
-        train_metrics["epoch_time"] = time.time() - t0
-
-        log_line = (
-            f"[{epoch + 1}/{args.num_train_epochs}] "
-            f"train loss {train_metrics['loss']:.4f} top1 {train_metrics['top1']:.4f} "
-            f"({train_metrics['epoch_time']:.1f}s)"
-        )
-        if task is not None:
-            report_split_metrics("train", train_metrics, epoch + 1)
-
-        if (epoch + 1) % args.eval_every == 0 or last_epoch:
-            val_metrics = evaluate(model, val_loader, objective, device, amp)
-            best_val_top1 = max(best_val_top1, val_metrics["top1"])
-            log_line += f" | val loss {val_metrics['loss']:.4f} top1 {val_metrics['top1']:.4f}"
-            if task is not None:
-                report_split_metrics("val", val_metrics, epoch + 1)
-        print(log_line)
-
-        if (epoch + 1) % args.save_every == 0 or last_epoch:
-            save_checkpoint(
-                ckpt_path, model, optimizer, scheduler, scaler, epoch,
-                extra={"best_val_top1": best_val_top1}
-            )
-            if task is not None and args.upload_checkpoint:
-                task.upload_artifact("checkpoint", artifact_object=ckpt_path, wait_on_upload=True)
-
-    # --- Итоговые метрики: финальная модель (конец косинусного графика) ---
-    if not val_metrics:
-        val_metrics = evaluate(model, val_loader, objective, device, amp)
-    test_metrics = evaluate(model, test_loader, objective, device, amp)
-    summary = {
-        "arch": args.arch,
-        "seed": args.seed,
-        "n_params": n_params,
-        "val": val_metrics,
-        "best_val_top1": best_val_top1,
-        "test": test_metrics,
-        "args": vars(args),
-    }
-    print(f"test top1 {test_metrics['top1']:.4f} top5 {test_metrics['top5']:.4f}")
-
+    agg = aggregate_runs(results)
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    weights_path = os.path.join(run_dir, "model_final.pt")
-    torch.save({"model": model.state_dict(), "args": vars(args)}, weights_path)
+        json.dump({**agg, "runs": results, "args": vars(args)}, f, ensure_ascii=False, indent=2)
+    test = agg["test"]
+    std = f" ± {test['top1_std']:.4f}" if "top1_std" in test else ""
+    print(f"{agg['n_params'] / 1e6:.2f}M параметров; test top1 {test['top1']:.4f}{std}")
 
     if task is not None:
-        from clearml import OutputModel
-
-        report_single_values("val", val_metrics)
-        report_single_values("test", test_metrics)
-        report_single_values("model", {"n_params": n_params, "best_val_top1": best_val_top1})
-        task.upload_artifact("summary", artifact_object=summary)
-        OutputModel(task=task, name=f"{args.arch}-seed{args.seed}", framework="PyTorch").update_weights(
-            weights_filename=weights_path, auto_delete_file=False
-        )
+        report_series(task, args, results, run_dir)
         task.close()
 
 

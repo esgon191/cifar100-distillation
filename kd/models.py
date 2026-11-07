@@ -2,6 +2,7 @@
 Архитектуры: учитель ResNet-50 под 32×32 и небольшая CNN-ученик
 """
 from argparse import Namespace
+from collections.abc import Callable
 
 import torch.nn as nn
 from torchvision.models import resnet50
@@ -69,15 +70,29 @@ class SimpleCNN(nn.Module):
 ARCHS = ("resnet50", "cnn")
 
 
+def model_spec(args: Namespace) -> tuple[Callable[..., nn.Module], dict]:
+    """
+    Класс (фабрика) модели и аргументы конструктора по аргументам CLI
+    (--arch и параметры ёмкости). Модель создаёт эксперимент — так он
+    управляет сидом инициализации весов
+    """
+    if args.arch == "resnet50":
+        return resnet50_cifar, {"num_classes": args.num_labels}
+    if args.arch == "cnn":
+        return SimpleCNN, {
+            "num_classes": args.num_labels,
+            "width": args.cnn_width,
+            "convs_per_stage": args.cnn_convs_per_stage,
+        }
+    raise ValueError(f"Неизвестная архитектура: {args.arch}")
+
+
 def build_model(args: Namespace) -> nn.Module:
     """
     Собирает модель по аргументам CLI (--arch и параметры ёмкости)
     """
-    if args.arch == "resnet50":
-        return resnet50_cifar(args.num_labels)
-    if args.arch == "cnn":
-        return SimpleCNN(args.num_labels, args.cnn_width, args.cnn_convs_per_stage)
-    raise ValueError(f"Неизвестная архитектура: {args.arch}")
+    model_cls, model_kwargs = model_spec(args)
+    return model_cls(**model_kwargs)
 
 
 def count_params(model: nn.Module) -> int:

@@ -77,7 +77,7 @@
 - Метрики в ClearML: график = метрика (`loss`, `ce`, `top1`, …), series = `train`/`val`.
   Итог — single values `test/*`, `val/*` + артефакт `summary`; итоговая метрика —
   финальная модель (конец косинуса), не лучшая по val.
-- Чекпоинт `out/<task_id>/checkpoint.pt` каждые `--save_every` эпох, `--resume` по
+- Чекпоинт `out/<task_id>/run_<i>/checkpoint.pt` (с шага 3; учитель писал в `out/<task_id>/`) каждые `--save_every` эпох, `--resume` по
   умолчанию; в Colab `--output_dir` — на Google Drive (см. «Запуск в Colab»), либо
   `--upload_checkpoint` (артефакт ClearML) + `--continue_task_id`.
 - `output_uri` = `Session.get_files_server_host()` (явно, мимо S3 из конфига);
@@ -125,6 +125,37 @@
 - Ориентир: ResNet-50 с этим рецептом на полном train — ≈77–79% top-1; у нас train 45k
   (5k ушло в val), возможна потеря ≈0.5 п.п.
 
+## Шаг 3: ученик и бейзлайн на CE
+
+Подробно — `docs/student.md`.
+
+- **Учитель обучен:** test top1 0.7951, задача ClearML `60b07234…`.
+- **Многократное обучение — `kd/experiment.py`:**
+  - абстрактный `Experiment(args, model_cls, model_kwargs, loaders, device, run_dir, task)`,
+    метод `run(n_runs, init_seed)`;
+  - подкласс задаёт `build_objective()` и `teacher()`; KD шага 4 — ещё один подкласс;
+  - `--init_seed` порождает сиды начальных весов (`SeedSequence.spawn`, префикс
+    стабилен при росте `--n_runs`);
+  - всё остальное случайное — от глобального `--seed`, общего для серии;
+  - одна серия — одна задача ClearML: series `train/run<i>`, `val/run<i>`
+    (при `n_runs=1` — `train`/`val`), single values — среднее и `_std`, артефакты `runs`
+    и `summary_run<i>`, в ClearML грузятся веса только `run_0`;
+  - каталоги `<output_dir>/<task_id>/run_<i>/`; запуск с `summary.json` пропускается.
+- **Подбор ёмкости — ClearML `HyperParameterOptimizer` + `GridSearch`**
+  (`scripts/capacity_search.py`):
+  - сетка `cnn_width` {16, 32, 48, 64} × `cnn_convs_per_stage` {1, 2}, каждая модель
+    обучается один раз, 100 эпох;
+  - цель — последнее `top1/val`;
+  - задачи исполняет `colab/agent.ipynb` (очередь `colab-t4`), код берётся из GitHub,
+    поэтому перед запуском нужен push;
+  - теги базовой задачи передаются строкой-списком `"['a', 'b']"`: агент разбирает
+    `nargs="*"` через yaml.
+- **Критерий выбора** (только val): отставание от учителя ≥ 10 п.п., точность ещё растёт
+  с ёмкостью, при прочих равных — меньшая модель.
+- **Бейзлайн:** выбранная модель, `--n_runs 10`, теги `student-ce baseline`
+  (`colab/train_students.ipynb`).
+- **Значимость разницы ученик/учитель не считаем** — по решению пользователя.
+
 ## Открытые вопросы
 
 - Пока нет.
@@ -139,3 +170,6 @@
 - Стиль кода — как в перенесённых файлах: функции с type hints и docstring'ами на русском,
   параметры по умолчанию в `cli/parser.py::DEFAULTS`.
 - Идём по шагам: после каждого шага — согласование с пользователем.
+- **Каждую команду командной строки комментировать перед запуском**: что она делает
+  и зачем (одна-две фразы в сообщении перед вызовом). Без комментария команды
+  не запускать.

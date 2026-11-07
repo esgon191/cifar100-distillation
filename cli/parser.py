@@ -11,6 +11,8 @@ DEFAULTS = {
     "val_size": 5000,
     "split_seed": 42,
     "seed": 0,
+    "init_seed": 0,
+    "n_runs": 1,
     "arch": "resnet50",
     "cnn_width": 32,
     "cnn_convs_per_stage": 2,
@@ -47,7 +49,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--task_name",
         type=str,
         default=None,
-        help="Имя задачи в ClearML (по умолчанию <arch>-seed<seed>)"
+        help="Имя задачи в ClearML (по умолчанию <arch>-seed<seed>-init<init_seed>[-x<n_runs>])"
     )
 
     p.add_argument(
@@ -158,7 +160,22 @@ def get_parser() -> argparse.ArgumentParser:
         "--seed",
         type=int,
         default=DEFAULTS["seed"],
-        help="Сид обучения (инициализация, порядок батчей, аугментации)"
+        help="Глобальный сид: порядок батчей, аугментации и прочая случайность "
+             "(кроме начальных весов); общий для всех запусков серии"
+    )
+
+    p.add_argument(
+        "--init_seed",
+        type=int,
+        default=DEFAULTS["init_seed"],
+        help="Сид, детерминирующий начальные состояния (веса) запусков серии"
+    )
+
+    p.add_argument(
+        "--n_runs",
+        type=int,
+        default=DEFAULTS["n_runs"],
+        help="Число запусков серии из разных начальных состояний"
     )
 
     p.add_argument(
