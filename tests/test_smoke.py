@@ -27,7 +27,7 @@ from kd.experiment import (
     verify_series_files,
 )
 from kd.models import SimpleCNN, build_model, count_params, model_spec
-from kd.stacked import StackedModel
+from kd.stacked import GroupedCNN, StackedModel, stack_models
 from kd.trainer import build_optimizer, build_scheduler, macro_precision_recall, set_seed
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -191,11 +191,15 @@ def _cnns(k: int, width: int = 4) -> list[torch.nn.Module]:
     return models
 
 
-def test_stacked_matches_separate_models():
+GROUP_IMPLS = [StackedModel, GroupedCNN]
+
+
+@pytest.mark.parametrize("impl", GROUP_IMPLS)
+def test_stacked_matches_separate_models(impl):
     """K моделей группы == K отдельных моделей: выходы, градиенты, BN-буферы, шаги SGD"""
     models = _cnns(3)
     refs = [copy.deepcopy(m) for m in models]
-    stacked = StackedModel(models)
+    stacked = impl(models)
     opt = build_optimizer(stacked, 0.1, 5e-4, decay_norm_bias=False)
     ref_opts = [build_optimizer(m, 0.1, 5e-4, decay_norm_bias=False) for m in refs]
 
@@ -230,9 +234,10 @@ def test_stacked_matches_separate_models():
             assert torch.allclose(m.eval()(x), out[k], atol=1e-5)
 
 
-def test_stacked_unstack_and_single():
+@pytest.mark.parametrize("impl", GROUP_IMPLS)
+def test_stacked_unstack_and_single(impl):
     models = _cnns(2)
-    stacked = StackedModel(models).eval()
+    stacked = impl(models).eval()
     x = torch.randn(4, 3, 32, 32)
     for k in range(2):
         plain = SimpleCNN(num_classes=10, width=4, convs_per_stage=1).eval()
@@ -241,7 +246,7 @@ def test_stacked_unstack_and_single():
             assert torch.allclose(plain(x), stacked(x)[k], atol=1e-5)
 
     # K=1 — без vmap, тот же результат; градиент доходит до сложенных параметров
-    single = StackedModel(_cnns(1))
+    single = impl(_cnns(1)).train()
     ref = _cnns(1)[0]
     out = single(x)
     assert out.shape == (1, 4, 10)
@@ -254,13 +259,26 @@ def test_stacked_unstack_and_single():
         assert torch.allclose(value.float(), state[name].float(), atol=1e-6), name
 
 
-def test_stacked_optimizer_groups():
+@pytest.mark.parametrize("impl", GROUP_IMPLS)
+def test_stacked_optimizer_groups(impl):
     """decay_norm_bias=False делит сложенные параметры так же, как параметры одной модели"""
     single = _cnns(1)[0]
-    stacked = StackedModel(_cnns(3))
+    stacked = impl(_cnns(3))
     n_single = [len(g["params"]) for g in build_optimizer(single, 0.1, 5e-4, decay_norm_bias=False).param_groups]
     n_stacked = [len(g["params"]) for g in build_optimizer(stacked, 0.1, 5e-4, decay_norm_bias=False).param_groups]
     assert n_single == n_stacked
+
+
+def test_stack_models_choice():
+    """SimpleCNN — GroupedCNN (и с channels_last); vmap с channels_last при K > 1 — ошибка"""
+    assert isinstance(stack_models(_cnns(2), channels_last=True), GroupedCNN)
+    with pytest.raises(ValueError):
+        stack_models([torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)], channels_last=True)
+    x = torch.randn(4, 3, 32, 32).to(memory_format=torch.channels_last)
+    group = stack_models(_cnns(2), channels_last=True).eval()
+    ref = _cnns(2)[1].eval()
+    with torch.no_grad():
+        assert torch.allclose(group(x)[1], ref(x), atol=1e-5)
 
 
 # --- Серия запусков на синтетических данных ---

@@ -35,7 +35,7 @@ import torch.nn as nn
 
 from kd.data import DeviceLoader
 from kd.models import count_params
-from kd.stacked import StackedModel
+from kd.stacked import stack_models
 from kd.trainer import (
     CrossEntropyObjective,
     build_optimizer,
@@ -281,7 +281,7 @@ class Experiment(ABC):
         loaders = self.loaders
         models = [self.build_model(seed) for seed in model_seeds]
         n_params = count_params(models[0])
-        model = StackedModel(models)
+        model = stack_models(models, channels_last=self.channels_last)
         del models
         teacher = self.teacher()
         objective = self.build_objective()
@@ -366,7 +366,7 @@ class Experiment(ABC):
         shutil.rmtree(group_dir, ignore_errors=True)
         return finals
 
-    def _final_measure(self, model: StackedModel, run_ids: list[int], model_seeds: list[int],
+    def _final_measure(self, model: nn.Module, run_ids: list[int], model_seeds: list[int],
                        n_params: int, best_val_top1: list[float], objective, teacher) -> list[dict]:
         """
         Финальный замер: финальные модели (конец косинуса) в режиме eval без

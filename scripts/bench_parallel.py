@@ -1,5 +1,5 @@
 """
-Замер скорости обучения группы из K моделей (kd/stacked.py) — для выбора --parallel_runs.
+Замер скорости обучения группы из K моделей (kd/stacked.py::stack_models) — для выбора --parallel_runs.
 Использует тот же train_one_epoch, что и train.py (AMP, GradScaler, общий батч),
 на случайных данных: важна только скорость. Запуск в Colab на T4:
     python scripts/bench_parallel.py --cnn_width 32 --cnn_convs_per_stage 2 --ks 1 2 5 10 20
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kd.data import DeviceLoader  # noqa: E402
 from kd.models import SimpleCNN  # noqa: E402
-from kd.stacked import StackedModel  # noqa: E402
+from kd.stacked import StackedModel, stack_models  # noqa: E402
 from kd.trainer import (  # noqa: E402
     CrossEntropyObjective,
     build_optimizer,
@@ -40,14 +40,18 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--channels_last", type=int, nargs="+", default=[0, 1],
                    help="Формат входа: 0 — contiguous, 1 — channels_last")
+    p.add_argument("--impl", choices=["grouped", "vmap"], default="grouped",
+                   help="grouped — GroupedCNN (как в train.py), vmap — StackedModel для сравнения")
     return p
 
 
 def bench(k: int, args, device: torch.device, channels_last: bool) -> dict:
     """Время шага группы из k моделей на args.steps шагах"""
     amp = device.type == "cuda"
-    models = [SimpleCNN(100, args.cnn_width, args.cnn_convs_per_stage).to(device) for _ in range(k)]
-    model = StackedModel(models)
+    memory_format = torch.channels_last if channels_last else torch.contiguous_format
+    models = [SimpleCNN(100, args.cnn_width, args.cnn_convs_per_stage).to(device, memory_format=memory_format)
+              for _ in range(k)]
+    model = StackedModel(models) if args.impl == "vmap" else stack_models(models, channels_last)
     optimizer = build_optimizer(model, 0.1, 5e-4)
     scheduler = build_scheduler(optimizer, total_steps=10 ** 6, warmup_steps=0)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
@@ -85,7 +89,14 @@ def main():
         print(f"{'K':>4} {'шаг, мс':>9} {'моделей·шагов/с':>16} {'ускорение':>10} {'память, ГБ':>11}")
         base = None
         for k in args.ks:
-            r = bench(k, args, device, bool(channels_last))
+            try:
+                r = bench(k, args, device, bool(channels_last))
+            except (RuntimeError, ValueError) as e:
+                # OOM или неподдерживаемая комбинация — печатаем и идём дальше
+                print(f"{k:>4} ошибка: {str(e).splitlines()[0][:100]}")
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
             if base is None:
                 # Пропускная способность одной модели — по первому K в списке (обычно 1)
                 base = r["throughput"] / k
