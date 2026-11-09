@@ -8,10 +8,22 @@ K копий сложены по новой оси 0, прямой проход 
 BatchNorm в режиме train обновляет running-статистики каждой модели отдельно
 """
 import copy
+import types
 
 import torch
 import torch.nn as nn
 from torch.func import functional_call, stack_module_state
+
+
+def _fp32_batch_norm_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    BatchNorm на входе fp32, выход — в dtype входа.
+    Правило vmap для batch_norm с собственными буферами у каждой модели передаёт
+    в cudnn_batch_norm фиктивный вес ones(..., dtype входа). Под AMP вход fp16,
+    а cuDNN требует вес fp32 — без приведения обучение падает с RuntimeError.
+    cuDNN и так считает BN в fp32, поэтому результат почти не меняется
+    """
+    return type(self).forward(self, x.float()).to(x.dtype)
 
 
 class StackedModel(nn.Module):
@@ -43,6 +55,9 @@ class StackedModel(nn.Module):
         # Каркас архитектуры без данных: не регистрируется как подмодуль,
         # чтобы его (пустые) параметры не попадали в parameters()/state_dict()
         base = copy.deepcopy(models[0]).to("meta")
+        for m in base.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.forward = types.MethodType(_fp32_batch_norm_forward, m)
         object.__setattr__(self, "_base", base)
         self._base.train(models[0].training)
         self.train(models[0].training)
