@@ -120,6 +120,37 @@ class CrossEntropyObjective:
         return loss, {"ce": loss.detach()}
 
 
+def per_model_kl(logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """
+    KL(softmax(z_t/T) ‖ softmax(z_s/T)) каждой модели группы, среднее по примерам:
+    logits [K, B, C], teacher_logits [B, C] (общие для группы) -> [K]
+    """
+    log_ps = F.log_softmax(logits / temperature, dim=-1)
+    log_pt = F.log_softmax(teacher_logits / temperature, dim=-1)
+    return (log_pt.exp() * (log_pt - log_ps)).sum(-1).mean(-1)
+
+
+class KDObjective:
+    """
+    Дистилляция: α·CE(y, z_s) + (1−α)·T²·KL(softmax(z_t/T) ‖ softmax(z_s/T)).
+    Множитель T² выравнивает масштаб градиента KL-слагаемого (он ∝ 1/T²) с CE.
+    Компоненты: ce и kl — kl без множителя T², как мера расхождения распределений
+    ученика и учителя при температуре T
+    """
+
+    def __init__(self, alpha: float, temperature: float):
+        self.alpha = alpha
+        self.temperature = temperature
+
+    def __call__(self, logits, targets, teacher_logits=None):
+        if teacher_logits is None:
+            raise ValueError("KDObjective: нужны логиты учителя (teacher или кэш логитов)")
+        ce = per_model_cross_entropy(logits, targets)
+        kl = per_model_kl(logits, teacher_logits, self.temperature)
+        loss = self.alpha * ce + (1 - self.alpha) * self.temperature ** 2 * kl
+        return loss, {"ce": ce.detach(), "kl": kl.detach()}
+
+
 def _topk_correct(logits: torch.Tensor, targets: torch.Tensor, k: int) -> torch.Tensor:
     """Число попаданий в top-k для каждой модели: logits [K, B, C] -> [K]"""
     topk = logits.topk(k, dim=-1).indices
@@ -153,6 +184,14 @@ def macro_precision_recall(
     return precision[present].mean().item(), recall[present].mean().item()
 
 
+def _unpack(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Батч (x, y) или (x, y, логиты учителя из кэша) -> (x, y, логиты | None)"""
+    if len(batch) == 3:
+        return batch
+    x, y = batch
+    return x, y, None
+
+
 def train_one_epoch(
         model: nn.Module,
         loader,
@@ -181,11 +220,11 @@ def train_one_epoch(
     sums: dict[str, torch.Tensor] = {}
     n_seen, skipped = 0, 0
 
-    for x, y in loader:
+    for batch in loader:
+        x, y, teacher_logits = _unpack(batch)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
             logits = model(x)
-            teacher_logits = None
-            if teacher is not None:
+            if teacher_logits is None and teacher is not None:
                 with torch.no_grad():
                     teacher_logits = teacher(x)
         loss, parts = objective(
@@ -244,10 +283,12 @@ def evaluate(
     all_preds, all_targets, all_logits = [], [], []
     num_classes = None
 
-    for x, y in loader:
+    for batch in loader:
+        x, y, teacher_logits = _unpack(batch)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
             logits = model(x)
-            teacher_logits = teacher(x) if teacher is not None else None
+            if teacher_logits is None and teacher is not None:
+                teacher_logits = teacher(x)
         logits = logits.float()
         loss, parts = objective(
             logits,

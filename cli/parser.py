@@ -2,8 +2,11 @@ import argparse
 
 from kd.models import ARCHS
 
+# Задача ClearML обученного учителя ResNet-50 (шаг 2, test top1 0.7951):
+# --teacher_task_id без значения берёт её
+TEACHER_TASK_ID = "60b072340b8f4e8aa2ef643d495307bf"
+
 # Все известные параметры по умолчанию
-# Набор будет расширяться по мере реализации шагов (KD-лосс)
 DEFAULTS = {
     "project_name": "cifar100-distillation",
     "data_dir": "data/cifar_100",
@@ -29,6 +32,12 @@ DEFAULTS = {
     "num_labels": 100,
     "eval_every": 1,
     "save_every": 5,
+    "teacher_task_id": None,
+    "teacher_checkpoint": None,
+    "teacher_cache_dir": None,
+    "teacher_online": False,
+    "kd_alpha": 0.5,
+    "kd_temperature": 4.0,
 }
 
 def get_parser() -> argparse.ArgumentParser:
@@ -185,6 +194,53 @@ def get_parser() -> argparse.ArgumentParser:
         default=DEFAULTS["parallel_runs"],
         help="Сколько запусков серии обучать одновременно одной группой на общих батчах "
              "(векторизованно, kd/stacked.py)"
+    )
+
+    # --- Дистилляция (KD) ---
+
+    p.add_argument(
+        "--teacher_task_id",
+        type=str,
+        nargs="?",
+        const=TEACHER_TASK_ID,
+        default=DEFAULTS["teacher_task_id"],
+        help="Задача ClearML учителя: включает KD. Без значения — обученный ResNet-50 "
+             f"({TEACHER_TASK_ID})"
+    )
+
+    p.add_argument(
+        "--teacher_checkpoint",
+        type=str,
+        default=DEFAULTS["teacher_checkpoint"],
+        help="Файл весов учителя (model_final.pt) вместо задачи ClearML: тоже включает KD"
+    )
+
+    p.add_argument(
+        "--kd_alpha",
+        type=float,
+        default=DEFAULTS["kd_alpha"],
+        help="α в α·CE + (1−α)·T²·KL: вес обучения на метках"
+    )
+
+    p.add_argument(
+        "--kd_temperature",
+        type=float,
+        default=DEFAULTS["kd_temperature"],
+        help="Температура T сглаживания логитов учителя и ученика"
+    )
+
+    p.add_argument(
+        "--teacher_cache_dir",
+        type=str,
+        default=DEFAULTS["teacher_cache_dir"],
+        help="Каталог кэша логитов учителя (по умолчанию <output_dir>/teacher_cache)"
+    )
+
+    p.add_argument(
+        "--teacher_online",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULTS["teacher_online"],
+        help="Прогонять учителя на каждом батче вместо кэша логитов"
     )
 
     p.add_argument(

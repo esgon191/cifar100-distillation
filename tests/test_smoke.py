@@ -19,6 +19,8 @@ from kd.data import DeviceLoader, load_cifar100, random_crop_flip, stratified_sp
 from kd.experiment import (
     RUN_FILES,
     CrossEntropyExperiment,
+    Experiment,
+    KDExperiment,
     Loaders,
     aggregate_final,
     collect_series,
@@ -28,7 +30,7 @@ from kd.experiment import (
 )
 from kd.models import SimpleCNN, build_model, count_params, model_spec
 from kd.stacked import GroupedCNN, StackedModel, stack_models
-from kd.trainer import build_optimizer, build_scheduler, macro_precision_recall, set_seed
+from kd.trainer import CrossEntropyObjective, KDObjective, build_optimizer, build_scheduler, macro_precision_recall, set_seed
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data", "cifar_100")
@@ -298,16 +300,17 @@ def _synthetic_loaders(n: int = 96) -> Loaders:
     )
 
 
-def _series(run_dir, parallel_runs: int, epochs: int = 2) -> CrossEntropyExperiment:
+def _series(run_dir, parallel_runs: int, epochs: int = 2, extra: tuple = (),
+            cls=CrossEntropyExperiment):
     args = get_parser().parse_args([
         "--arch", "cnn", "--cnn_width", "4", "--cnn_convs_per_stage", "1", "--num_labels", "10",
         "--num_train_epochs", str(epochs), "--warmup_epochs", "0", "--save_every", "1",
-        "--parallel_runs", str(parallel_runs), "--task_name", "t",
+        "--parallel_runs", str(parallel_runs), "--task_name", "t", *extra,
     ])
     model_cls, model_kwargs = model_spec(args)
     set_seed(args.seed)
-    return CrossEntropyExperiment(args, model_cls, model_kwargs, _synthetic_loaders(),
-                                  torch.device("cpu"), str(run_dir))
+    return cls(args, model_cls, model_kwargs, _synthetic_loaders(),
+               torch.device("cpu"), str(run_dir))
 
 
 def test_series_parallel_equals_sequential(tmp_path):
@@ -432,3 +435,54 @@ def test_train_series(tmp_path):
     out = subprocess.run(cmd + ["--report_only"], cwd=ROOT, capture_output=True, text=True,
                          check=True).stdout
     assert "уже завершён" not in out and "test top1" in out
+
+
+# --- KD-лосс (kd/trainer.py::KDObjective) ---
+
+def test_kd_objective_formula():
+    """KDObjective = α·CE + (1−α)·T²·KL — сверка с F.kl_div по каждой модели группы"""
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn(3, 8, 10, generator=gen) * 3
+    teacher = torch.randn(8, 10, generator=gen) * 3
+    y = torch.randint(0, 10, (8,), generator=gen)
+    alpha, t = 0.3, 4.0
+    loss, parts = KDObjective(alpha, t)(logits, y, teacher)
+    assert loss.shape == parts["ce"].shape == parts["kl"].shape == (3,)
+    for k in range(3):
+        ce = F.cross_entropy(logits[k], y)
+        kl = F.kl_div(F.log_softmax(logits[k] / t, -1), F.log_softmax(teacher / t, -1),
+                      log_target=True, reduction="batchmean")
+        assert torch.allclose(parts["ce"][k], ce, atol=1e-6)
+        assert torch.allclose(parts["kl"][k], kl, atol=1e-6)
+        assert torch.allclose(loss[k], alpha * ce + (1 - alpha) * t ** 2 * kl, atol=1e-5)
+    assert (parts["kl"] >= 0).all()
+
+    # Ученик совпадает с учителем — KL = 0; α=1 — чистая CE
+    _, same = KDObjective(0.5, 2.0)(teacher[None].repeat(2, 1, 1), y, teacher)
+    assert torch.allclose(same["kl"], torch.zeros(2), atol=1e-6)
+    ce_only, _ = KDObjective(1.0, 4.0)(logits, y, teacher)
+    assert torch.allclose(ce_only, CrossEntropyObjective()(logits, y)[0], atol=1e-6)
+    with pytest.raises(ValueError):
+        KDObjective(0.5, 4.0)(logits, y, None)
+
+
+def test_kd_alpha1_equals_ce_series(tmp_path):
+    """KD-серия с α=1 (учитель не влияет на градиент) == CE-серия: метрики и веса"""
+    ce = _series(tmp_path / "ce", parallel_runs=2).run(2, init_seed=0)
+    kd_exp = _series(tmp_path / "kd", parallel_runs=2, cls=KDExperiment,
+                     extra=("--teacher_checkpoint", "unused", "--kd_alpha", "1.0"))
+    # Учитель — фиксированная случайная сеть, онлайн: для формулы не важно, откуда логиты
+    torch.manual_seed(123)
+    kd_exp._teacher = SimpleCNN(num_classes=10, width=4, convs_per_stage=1).eval()
+    set_seed(kd_exp.args.seed)
+    kd = Experiment.run(kd_exp, 2, init_seed=0)
+    for a, b in zip(ce, kd):
+        for split in ("train", "val", "test"):
+            assert b[split]["kl"] > 0
+            for metric in ("ce", "top1", "top5"):
+                assert a[split][metric] == pytest.approx(b[split][metric], abs=1e-5), (split, metric)
+    for i in range(2):
+        wa = torch.load(tmp_path / "ce" / f"run_{i}" / "model_final.pt")["model"]
+        wb = torch.load(tmp_path / "kd" / f"run_{i}" / "model_final.pt")["model"]
+        for name in wa:
+            assert torch.allclose(wa[name].float(), wb[name].float(), atol=1e-5), name

@@ -1,4 +1,19 @@
-from clearml import Dataset, Logger
+from clearml import Dataset, Logger, Task
+
+
+def download_task_model(task_id: str) -> str:
+    """
+    Локальный путь к последней выходной модели задачи (для учителя — model_final.pt).
+    Файл скачивается с files server в локальный кэш ClearML; повторный вызов
+    берёт его оттуда
+    """
+    models = Task.get_task(task_id=task_id).models["output"]
+    if not models:
+        raise RuntimeError(f"У задачи ClearML {task_id} нет выходных моделей")
+    path = models[-1].get_local_copy()
+    if not path:
+        raise RuntimeError(f"Не удалось скачать модель задачи {task_id} ({models[-1].url})")
+    return path
 
 
 def get_clearml_dataset(

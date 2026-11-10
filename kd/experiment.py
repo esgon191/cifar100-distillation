@@ -36,8 +36,17 @@ import torch.nn as nn
 from kd.data import DeviceLoader
 from kd.models import count_params
 from kd.stacked import stack_models
+from kd.teacher_cache import (
+    TeacherCache,
+    TeacherLogitsLoader,
+    build_teacher_cache,
+    cache_identity,
+    load_teacher,
+    verify_cache,
+)
 from kd.trainer import (
     CrossEntropyObjective,
+    KDObjective,
     build_optimizer,
     build_scheduler,
     evaluate,
@@ -224,7 +233,12 @@ class Experiment(ABC):
             "n_params": self.count_model_params(),
             "git_commit": _git_commit(),
             "args": vars(self.args),
+            **self.series_extra(),
         })
+
+    def series_extra(self) -> dict:
+        """Дополнительные поля series.json (у KD — кэш и качество учителя)"""
+        return {}
 
     # --- Обучение ---
 
@@ -439,6 +453,71 @@ class CrossEntropyExperiment(Experiment):
 
     def build_objective(self):
         return CrossEntropyObjective(self.args.label_smoothing)
+
+
+class KDExperiment(Experiment):
+    """
+    Ученик с дистилляцией: KDObjective(--kd_alpha, --kd_temperature).
+    Логиты учителя по умолчанию — из кэша (kd/teacher_cache.py): он строится
+    один раз (или достраивается) перед серией и общий для всех KD-серий с теми же
+    батчами; загрузчики отдают батчи (x, y, логиты учителя). С --teacher_online
+    учитель прогоняется на каждом батче (один раз на группу)
+    """
+
+    _teacher: nn.Module | None = None
+
+    def build_objective(self):
+        return KDObjective(self.args.kd_alpha, self.args.kd_temperature)
+
+    def teacher(self) -> nn.Module | None:
+        return self._teacher
+
+    def series_extra(self) -> dict:
+        cache = getattr(self, "teacher_cache", None)
+        if cache is None:
+            return {"teacher_cache": None}
+        return {"teacher_cache": cache.dir,
+                "teacher_test_top1": cache.meta().get("teacher_test_top1")}
+
+    def run(self, n_runs: int, init_seed: int) -> list[dict]:
+        self.prepare_teacher()
+        return super().run(n_runs, init_seed)
+
+    def prepare_teacher(self) -> None:
+        """Загружает учителя; без --teacher_online — строит кэш и подменяет загрузчики"""
+        args = self.args
+        # Создание ResNet-50 расходует глобальный генератор — изолируем
+        with torch.random.fork_rng(devices=[]):
+            teacher = load_teacher(
+                self.device, task_id=args.teacher_task_id, checkpoint=args.teacher_checkpoint,
+                num_classes=args.num_labels, channels_last=self.channels_last
+            )
+        if args.teacher_online:
+            self._teacher = teacher
+            return
+
+        loaders = self.loaders
+        root = args.teacher_cache_dir or os.path.join(args.output_dir, "teacher_cache")
+        identity = cache_identity(args, len(loaders.train.y), len(loaders.train),
+                                  self.device, self.amp)
+        cache = TeacherCache(os.path.abspath(root), identity)
+        build_teacher_cache(teacher, loaders, args.num_train_epochs, cache, self.device, self.amp)
+        verify_cache(teacher, loaders.train, cache, 0, self.device, self.amp)
+
+        wrap = lambda loader, split: (
+            None if loader is None else TeacherLogitsLoader(loader, cache, split, self.device)
+        )
+        self.loaders = Loaders(
+            train=wrap(loaders.train, "train"),
+            val=wrap(loaders.val, "val"),
+            test=wrap(loaders.test, "test"),
+            train_eval=wrap(loaders.train_eval, "train_eval"),
+        )
+        self.teacher_cache = cache
+        # Учитель больше не нужен: логиты — из кэша
+        del teacher
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 # --- Сборка серии из файлов ---

@@ -3,6 +3,10 @@
 в ClearML. Пример:
     python train.py --arch resnet50 --seed 0 --tags teacher
     python train.py --arch cnn --cnn_width 32 --n_runs 10 --init_seed 0 --tags student-ce
+    python train.py --arch cnn --n_runs 10 --teacher_task_id --kd_alpha 0.5 --kd_temperature 4
+
+С --teacher_task_id / --teacher_checkpoint — дистилляция (kd/experiment.py::KDExperiment):
+логиты учителя считаются один раз в кэш <output_dir>/teacher_cache (kd/teacher_cache.py).
 
 --n_runs запусков серии отличаются только начальными весами (сиды из --init_seed);
 порядок батчей, аугментации и прочую случайность задаёт общий --seed
@@ -18,10 +22,11 @@ import json
 import os
 
 from cli.parser import get_parser
-from cli.validators import validate_args
+from cli.validators import is_kd, validate_args
 from kd.data import DeviceLoader, load_cifar100, stratified_split
 from kd.experiment import (
     CrossEntropyExperiment,
+    KDExperiment,
     Loaders,
     aggregate_final,
     collect_series,
@@ -35,6 +40,8 @@ from utils.clearml_utils import get_clearml_dataset, report_single_values
 def default_task_name(args) -> str:
     """Имя задачи по умолчанию: архитектура, ёмкость, сиды и число запусков"""
     arch = args.arch if args.arch != "cnn" else f"cnn-w{args.cnn_width}-c{args.cnn_convs_per_stage}"
+    if is_kd(args):
+        arch += f"-kd-a{args.kd_alpha:g}-T{args.kd_temperature:g}"
     name = f"{arch}-seed{args.seed}-init{args.init_seed}"
     return name if args.n_runs == 1 else f"{name}-x{args.n_runs}"
 
@@ -179,11 +186,16 @@ def train_series(args, task, run_dir: str) -> None:
     # --- Серия запусков ---
     model_cls, model_kwargs = model_spec(args)
     os.makedirs(run_dir, exist_ok=True)
-    experiment = CrossEntropyExperiment(
+    experiment_cls = KDExperiment if is_kd(args) else CrossEntropyExperiment
+    experiment = experiment_cls(
         args, model_cls, model_kwargs, loaders, device, run_dir, task=task
     )
     print(f"{args.task_name}: запусков {args.n_runs}, init_seed {args.init_seed}, "
           f"одновременно {args.parallel_runs}")
+    if is_kd(args):
+        print(f"KD: α={args.kd_alpha}, T={args.kd_temperature}, учитель "
+              f"{args.teacher_task_id or args.teacher_checkpoint}, "
+              f"{'онлайн' if args.teacher_online else 'кэш логитов'}")
     experiment.run(args.n_runs, args.init_seed)
 
 

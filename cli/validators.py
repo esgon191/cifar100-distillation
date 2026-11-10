@@ -30,3 +30,19 @@ def validate_args(args) -> None:
         raise ArgumentTypeError("--report_only с ClearML требует --continue_task_id серии")
     if args.continue_task_id and not args.clearml:
         raise ArgumentTypeError("--continue_task_id требует --clearml")
+    if args.teacher_task_id and args.teacher_checkpoint:
+        raise ArgumentTypeError("учитель задаётся одним из --teacher_task_id / --teacher_checkpoint")
+    if is_kd(args):
+        if args.arch != "cnn":
+            raise ArgumentTypeError("KD (учитель задан) — только для ученика --arch cnn")
+        if not 0 <= args.kd_alpha <= 1:
+            raise ArgumentTypeError("--kd_alpha должен быть в интервале [0, 1]")
+        if args.kd_temperature <= 0:
+            raise ArgumentTypeError("--kd_temperature должен быть > 0")
+        if args.label_smoothing:
+            raise ArgumentTypeError("--label_smoothing в KD не поддерживается")
+
+
+def is_kd(args) -> bool:
+    """Обучение с учителем: задан источник его весов"""
+    return bool(args.teacher_task_id or args.teacher_checkpoint)
